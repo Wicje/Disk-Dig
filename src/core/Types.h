@@ -8,7 +8,8 @@ namespace dd {
 
 enum class Chance { High, Medium, Low };
 enum class Status { Existing, Deleted, Carved };
-enum class FsKind { Ext, Fat, Ntfs, Unknown, WholeDisk };
+enum class FsKind { Ext, Fat, ExFat, Ntfs, Unknown, WholeDisk };
+enum class Category { All, Pictures, Videos, Audio, Documents, Archives, Other };
 
 struct ByteRange {
     uint64_t offset = 0;  // absolute offset in source bytes
@@ -66,6 +67,7 @@ struct ScanStats {
     uint64_t total = 0;
     uint32_t extFound = 0;
     uint32_t fatFound = 0;
+    uint32_t exfatFound = 0;
     uint32_t ntfsFound = 0;
     uint32_t carvedFound = 0;
     uint32_t existingFound = 0;
@@ -77,6 +79,9 @@ using ResultFn = std::function<void(const FileRecord &record)>;
 const char *chanceName(Chance c);
 const char *statusName(Status s);
 const char *fsName(FsKind f);
+const char *categoryName(Category c);
+Category categoryFromName(const std::string &name);
+Category categoryFromType(const std::string &type);
 std::string formatBytes(uint64_t n);
 std::string typeFromName(const std::string &name);
 

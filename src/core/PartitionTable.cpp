@@ -8,6 +8,66 @@ bool hasMBRSignature(const RawReader &r) {
     return r.u16(510, nullptr) == 0xAA55;
 }
 
+bool isPow2(uint32_t v) {
+    return v && ((v & (v - 1)) == 0);
+}
+
+FsKind probeFat(const RawReader &r, uint64_t off) {
+    bool ok = false;
+    uint16_t bytesPerSector = r.u16(off + 11, &ok); if (!ok) return FsKind::Unknown;
+    uint8_t sectorsPerCluster = r.u8(off + 13, &ok); if (!ok) return FsKind::Unknown;
+    uint16_t reservedSectors = r.u16(off + 14, &ok); if (!ok) return FsKind::Unknown;
+    uint8_t numFATs = r.u8(off + 16, &ok); if (!ok) return FsKind::Unknown;
+    uint16_t rootEntries = r.u16(off + 17, &ok); if (!ok) return FsKind::Unknown;
+    uint16_t totalSec16 = r.u16(off + 19, &ok); if (!ok) return FsKind::Unknown;
+    uint16_t fatSize16 = r.u16(off + 22, &ok); if (!ok) return FsKind::Unknown;
+    uint32_t totalSec32 = r.u32(off + 32, &ok); if (!ok) return FsKind::Unknown;
+    uint32_t fatSize32 = r.u32(off + 36, &ok); if (!ok) return FsKind::Unknown;
+
+    if (bytesPerSector < 512 || bytesPerSector > 4096 || !isPow2(bytesPerSector)) return FsKind::Unknown;
+    if (sectorsPerCluster == 0 || sectorsPerCluster > 128 || numFATs == 0) return FsKind::Unknown;
+
+    uint64_t fatSectors = fatSize32 ? fatSize32 : fatSize16;
+    uint64_t totalSectors = totalSec16 ? totalSec16 : totalSec32;
+    if (fatSectors == 0 || totalSectors == 0) return FsKind::Unknown;
+
+    uint64_t rootDirSectors = ((static_cast<uint64_t>(rootEntries) * 32 + bytesPerSector - 1) /
+                               bytesPerSector);
+    uint64_t overhead = static_cast<uint64_t>(reservedSectors) +
+                        static_cast<uint64_t>(numFATs) * fatSectors + rootDirSectors;
+    if (overhead >= totalSectors) return FsKind::Unknown;
+    uint64_t clusterCount = (totalSectors - overhead) / sectorsPerCluster;
+    if (clusterCount < 1) return FsKind::Unknown;
+
+    char sig[8]{};
+    bool hasFat32Sig = r.readExact(off + 82, sig, 8) && std::memcmp(sig, "FAT32   ", 8) == 0;
+    bool hasFat16Sig = r.readExact(off + 54, sig, 8) && std::memcmp(sig, "FAT16   ", 8) == 0;
+    if (hasFat32Sig || (rootEntries == 0 && clusterCount >= 65525)) return FsKind::Fat;
+    if (hasFat16Sig || (rootEntries > 0 && clusterCount >= 4085 && clusterCount < 65525))
+        return FsKind::Fat;
+    return FsKind::Unknown;
+}
+
+bool probeExfat(const RawReader &r, uint64_t off) {
+    bool ok = false;
+    uint8_t sectorShift = r.u8(off + 0x6C, &ok); if (!ok) return false;
+    uint8_t clusterShift = r.u8(off + 0x6D, &ok); if (!ok) return false;
+    uint8_t numFATs = r.u8(off + 0x6E, &ok); if (!ok) return false;
+    uint32_t fatOffset = r.u32(off + 0x50, &ok); if (!ok) return false;
+    uint32_t fatLength = r.u32(off + 0x54, &ok); if (!ok) return false;
+    uint32_t heapOffset = r.u32(off + 0x58, &ok); if (!ok) return false;
+    uint32_t clusterCount = r.u32(off + 0x5C, &ok); if (!ok) return false;
+    uint32_t rootCluster = r.u32(off + 0x60, &ok); if (!ok) return false;
+    if (sectorShift < 9 || sectorShift > 12 || clusterShift > 25 || numFATs == 0) return false;
+    if (fatLength == 0 || clusterCount == 0 || heapOffset == 0) return false;
+    if (rootCluster < 2 || rootCluster > clusterCount + 1) return false;
+    uint64_t bps = uint64_t{1} << sectorShift;
+    uint64_t fatEnd = (static_cast<uint64_t>(fatOffset) + static_cast<uint64_t>(fatLength) * numFATs) * bps;
+    uint64_t heapStart = static_cast<uint64_t>(heapOffset) * bps;
+    if (heapStart < fatEnd && heapStart < r.size()) return false;
+    return true;
+}
+
 } // namespace
 
 bool hasGPT(const RawReader &r) {
@@ -23,12 +83,11 @@ FsKind probeFs(const RawReader &r, uint64_t off, std::string *label) {
         return FsKind::Ext;
     if (r.readExact(off + 3, sig, 8) && std::memcmp(sig, "NTFS    ", 8) == 0)
         return FsKind::Ntfs;
-    if (r.readExact(off + 82, sig, 8) && std::memcmp(sig, "FAT32   ", 8) == 0)
-        return FsKind::Fat;
-    if (r.readExact(off + 54, sig, 8) && std::memcmp(sig, "FAT16   ", 8) == 0)
-        return FsKind::Fat;
-    if (r.readExact(off + 3, sig, 8) && std::memcmp(sig, "EXFAT   ", 8) == 0)
-        return FsKind::Fat;
+    if (r.readExact(off + 3, sig, 8) && std::memcmp(sig, "EXFAT   ", 8) == 0 &&
+        probeExfat(r, off))
+        return FsKind::ExFat;
+    FsKind fat = probeFat(r, off);
+    if (fat != FsKind::Unknown) return fat;
     if (label && r.readExact(off + 1024 + 120, sig, 16)) {
         std::string s(sig, 16);
         if (s[0]) *label = s;
@@ -39,6 +98,20 @@ FsKind probeFs(const RawReader &r, uint64_t off, std::string *label) {
 std::vector<Partition> readPartitions(const RawReader &r) {
     std::vector<Partition> parts;
     if (!r.isOpen() || r.size() < 1024) return parts;
+
+    std::string wholeLabel;
+    FsKind wholeFs = probeFs(r, 0, &wholeLabel);
+    if (wholeFs != FsKind::Unknown) {
+        Partition whole;
+        whole.number = 0;
+        whole.start = 0;
+        whole.length = r.size();
+        whole.fs = wholeFs;
+        whole.fsLabel = wholeLabel;
+        whole.description = std::string("Whole device ") + fsName(wholeFs);
+        parts.push_back(whole);
+        return parts;
+    }
 
     if (hasGPT(r)) {
         uint32_t entrySize = r.u32(512 + 84, nullptr);
@@ -63,7 +136,8 @@ std::vector<Partition> readPartitions(const RawReader &r) {
             p.fs = probeFs(r, p.start, &p.fsLabel);
             p.description = p.fs == FsKind::Unknown ? "Unknown partition" :
                             (p.fs == FsKind::Ext ? "Linux filesystem" :
-                             p.fs == FsKind::Fat ? "FAT filesystem" : "NTFS partition");
+                             p.fs == FsKind::Fat ? "FAT filesystem" :
+                             p.fs == FsKind::ExFat ? "exFAT partition" : "NTFS partition");
             parts.push_back(p);
         }
         if (!parts.empty()) return parts;
@@ -86,10 +160,15 @@ std::vector<Partition> readPartitions(const RawReader &r) {
             p.number = static_cast<uint32_t>(i + 1);
             p.type = type;
             p.fs = probeFs(r, p.start, &p.fsLabel);
-            if (p.fs == FsKind::Unknown && (type == 0x83 || type == 0x07 || type == 0x0b || type == 0x0c))
-                p.fs = type == 0x07 ? FsKind::Ntfs : FsKind::Ext;
+            if (p.fs == FsKind::Unknown) {
+                if (type == 0x07) p.fs = FsKind::Ntfs;
+                else if (type == 0x01 || type == 0x04 || type == 0x06 || type == 0x0b ||
+                         type == 0x0c || type == 0x0e || type == 0x0f) p.fs = FsKind::Fat;
+                else if (type == 0x83) p.fs = FsKind::Ext;
+            }
             p.description = p.fs == FsKind::Ext ? "Linux filesystem" :
                             p.fs == FsKind::Fat ? "FAT filesystem" :
+                            p.fs == FsKind::ExFat ? "exFAT partition" :
                             p.fs == FsKind::Ntfs ? "NTFS partition" : "MBR partition";
             parts.push_back(p);
         }

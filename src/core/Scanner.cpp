@@ -45,6 +45,7 @@ void runScan(ScanSession &session, const std::string &path,
         switch (p.fs) {
             case FsKind::Ext: scanExt4(ctx); break;
             case FsKind::Fat: scanFat32(ctx); break;
+            case FsKind::ExFat: scanExfat(ctx); break;
             case FsKind::Ntfs: scanNtfs(ctx); break;
             default: break;
         }

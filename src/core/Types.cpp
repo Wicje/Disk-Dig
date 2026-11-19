@@ -23,7 +23,8 @@ const char *statusName(Status s) {
 const char *fsName(FsKind f) {
     switch (f) {
         case FsKind::Ext: return "ext2/3/4";
-        case FsKind::Fat: return "FAT32";
+        case FsKind::Fat: return "FAT12/16/32";
+        case FsKind::ExFat: return "exFAT";
         case FsKind::Ntfs: return "NTFS";
         case FsKind::WholeDisk: return "Raw";
         case FsKind::Unknown: return "Unknown";
@@ -40,6 +41,79 @@ std::string formatBytes(uint64_t n) {
     if (i == 0) snprintf(buf, sizeof buf, "%llu %s", (unsigned long long)n, units[i]);
     else snprintf(buf, sizeof buf, "%.1f %s", v, units[i]);
     return buf;
+}
+
+const char *categoryName(Category c) {
+    switch (c) {
+        case Category::All: return "All files";
+        case Category::Pictures: return "Pictures";
+        case Category::Videos: return "Videos";
+        case Category::Audio: return "Audio";
+        case Category::Documents: return "Documents";
+        case Category::Archives: return "Archives";
+        case Category::Other: return "Other";
+    }
+    return "Other";
+}
+
+Category categoryFromName(const std::string &name) {
+    auto dot = name.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= name.size()) return Category::Other;
+    std::string ext = name.substr(dot + 1);
+    for (char &c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    struct Entry { const char *ext; Category cat; };
+    static const Entry table[] = {
+        {"jpg",Category::Pictures},{"jpeg",Category::Pictures},{"png",Category::Pictures},
+        {"gif",Category::Pictures},{"bmp",Category::Pictures},{"tif",Category::Pictures},
+        {"tiff",Category::Pictures},{"webp",Category::Pictures},{"heic",Category::Pictures},
+        {"heif",Category::Pictures},{"raw",Category::Pictures},{"cr2",Category::Pictures},
+        {"nef",Category::Pictures},{"arw",Category::Pictures},{"dng",Category::Pictures},
+        {"svg",Category::Pictures},{"ico",Category::Pictures},{"psd",Category::Pictures},
+        {"mp4",Category::Videos},{"mov",Category::Videos},{"avi",Category::Videos},
+        {"mkv",Category::Videos},{"webm",Category::Videos},{"wmv",Category::Videos},
+        {"flv",Category::Videos},{"3gp",Category::Videos},{"m4v",Category::Videos},
+        {"mpg",Category::Videos},{"mpeg",Category::Videos},{"ts",Category::Videos},
+        {"m2ts",Category::Videos},{"mts",Category::Videos},{"vob",Category::Videos},
+        {"mp3",Category::Audio},{"wav",Category::Audio},{"flac",Category::Audio},
+        {"aac",Category::Audio},{"ogg",Category::Audio},{"m4a",Category::Audio},
+        {"wma",Category::Audio},{"opus",Category::Audio},{"mid",Category::Audio},
+        {"midi",Category::Audio},{"aiff",Category::Audio},{"mka",Category::Audio},
+        {"pdf",Category::Documents},{"doc",Category::Documents},{"docx",Category::Documents},
+        {"xls",Category::Documents},{"xlsx",Category::Documents},{"ppt",Category::Documents},
+        {"pptx",Category::Documents},{"odt",Category::Documents},{"ods",Category::Documents},
+        {"odp",Category::Documents},{"rtf",Category::Documents},{"txt",Category::Documents},
+        {"csv",Category::Documents},{"log",Category::Documents},{"md",Category::Documents},
+        {"json",Category::Documents},{"xml",Category::Documents},{"html",Category::Documents},
+        {"htm",Category::Documents},{"epub",Category::Documents},{"mobi",Category::Documents},
+        {"dwg",Category::Documents},{"key",Category::Documents},{"pages",Category::Documents},
+        {"numbers",Category::Documents},{"zip",Category::Archives},{"rar",Category::Archives},
+        {"7z",Category::Archives},{"tar",Category::Archives},{"gz",Category::Archives},
+        {"bz2",Category::Archives},{"xz",Category::Archives},{"iso",Category::Archives},
+        {"tgz",Category::Archives},{"zst",Category::Archives},{"cab",Category::Archives},
+        {"arj",Category::Archives},{"lz4",Category::Archives},{"apk",Category::Archives},
+    };
+    for (const auto &e : table)
+        if (ext == e.ext) return e.cat;
+    return Category::Other;
+}
+
+Category categoryFromType(const std::string &type) {
+    std::string t = type;
+    for (char &c : t) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    auto has = [&](const char *word) { return t.find(word) != std::string::npos; };
+    if (has("image") || has("photo") || has("icon") || has("illustrator") ||
+        has("photoshop") || has("vector"))
+        return Category::Pictures;
+    if (has("video") || has("movie")) return Category::Videos;
+    if (has("audio") || has("mp3") || has("sound")) return Category::Audio;
+    if (has("archive") || has("gzip") || has("bzip") || has("disc image") ||
+        has("7-zip") || has("tar"))
+        return Category::Archives;
+    if (has("document") || has("text") || has("sheet") || has("powerpoint") ||
+        has("opendocument") || has("markdown") || has("web page") || has("e-book") ||
+        has("json") || has("xml") || has("log") || has("csv"))
+        return Category::Documents;
+    return Category::Other;
 }
 
 std::string typeFromName(const std::string &name) {

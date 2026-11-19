@@ -11,6 +11,8 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <new>
 #include <string>
@@ -22,6 +24,18 @@ void runApp();
 }
 
 namespace {
+
+struct TreeNode {
+    int recordIndex = -1;  // -1 = folder node
+    std::string label;
+    std::string key;       // folder open-state key
+    int depth = 0;
+    bool folder = false;
+    bool open = true;
+    bool hasChildren = false;
+    uint64_t sizeSum = 0;
+    uint32_t fileCount = 0;
+};
 
 struct AppState {
     std::vector<dd::DeviceInfo> devices;
@@ -43,7 +57,15 @@ struct AppState {
     int filter = 0;
     char search[256] = {};
     int selectedRow = -1;
-    std::vector<int> visible;
+
+    int category = 0;  // 0 = all files, 1..6 = category filter
+    std::vector<TreeNode> tree;
+    bool treeDirty = true;
+    int treeFilter = -1;
+    int treeCategory = -1;
+    size_t treeRecordCount = 0;
+    char treeSearch[256] = {};
+    std::map<std::string, bool> folderOpen;  // absent key = expanded
 
     std::thread recoveryThread;
     std::atomic<bool> recovering{false};
@@ -69,9 +91,13 @@ void setPhase(AppState &s, const char *phase) {
 void resetResults(AppState &s) {
     s.resultsReady = false;
     s.selected.clear();
-    s.visible.clear();
+    s.tree.clear();
+    s.treeDirty = true;
+    s.folderOpen.clear();
+    s.category = 0;
     s.selectedRow = -1;
     s.filter = 0;
+    s.search[0] = 0;
     s.session.~ScanSession();
     new (&s.session) dd::ScanSession{};
     s.summaryText.clear();
@@ -164,9 +190,15 @@ void startRecovery(AppState &s) {
                  summary.succeeded, summary.failed,
                  dd::formatBytes(summary.bytesWritten).c_str(),
                  summary.reportPath.empty() ? "(none)" : summary.reportPath.c_str());
+        std::string full = buffer;
+        size_t shown = 0;
+        for (const std::string &err : summary.errors) {
+            if (shown++ >= 4) { full += "\n  ... (" + std::to_string(summary.errors.size() - shown + 1) + " more)"; break; }
+            full += "\n  ! " + err;
+        }
         {
             std::lock_guard<std::mutex> lock(s.textMutex);
-            s.summaryText = buffer;
+            s.summaryText = full;
             s.recoverPhase = "Recovery complete";
         }
         s.recoverSuccess = ok && summary.failed == 0 && !s.cancelRecovery.load();
@@ -189,16 +221,108 @@ bool containsCI(const std::string &text, const char *needle) {
     return a.find(b) != std::string::npos;
 }
 
-void rebuildVisible(AppState &s) {
-    s.visible.clear();
+int categoryOf(const dd::FileRecord &r) {
+    dd::Category c = dd::categoryFromName(r.name);
+    if (c == dd::Category::Other) c = dd::categoryFromType(r.type);
+    return static_cast<int>(c);
+}
+
+// Rebuilds the folder tree shown in the results view: category roots, then the
+// original folder hierarchy of each file, like Disk Drill's "Reconstructed".
+void rebuildTree(AppState &s) {
+    if (!s.treeDirty && s.treeFilter == s.filter && s.treeCategory == s.category &&
+        s.treeRecordCount == s.session.records.size() &&
+        std::strcmp(s.treeSearch, s.search) == 0)
+        return;
+    s.treeDirty = false;
+    s.treeFilter = s.filter;
+    s.treeCategory = s.category;
+    s.treeRecordCount = s.session.records.size();
+    std::snprintf(s.treeSearch, sizeof(s.treeSearch), "%s", s.search);
+
+    s.tree.clear();
     if (!s.resultsReady) return;
+
+    struct BuildNode {
+        std::map<std::string, BuildNode> children;
+        std::vector<int> files;
+    };
+
+    BuildNode roots[7];
     for (size_t i = 0; i < s.session.records.size(); ++i) {
         const dd::FileRecord &r = s.session.records[i];
         if (s.filter == 1 && r.status != dd::Status::Existing) continue;
         if (s.filter == 2 && r.status != dd::Status::Deleted) continue;
         if (s.filter == 3 && r.status != dd::Status::Carved) continue;
         if (!containsCI(r.name, s.search) && !containsCI(r.path, s.search)) continue;
-        s.visible.push_back(static_cast<int>(i));
+        if (r.type == "Directory") continue;  // folders come from the path structure
+        int cat = categoryOf(r);
+        if (s.category != 0 && cat != s.category) continue;
+
+        BuildNode *node = &roots[cat];
+        std::string comp;
+        for (size_t p = 0; p < r.path.size(); ++p) {
+            if (r.path[p] == '/') {
+                if (!comp.empty()) {
+                    node = &node->children[comp];
+                    comp.clear();
+                }
+            } else {
+                comp.push_back(r.path[p]);
+            }
+        }
+        node->files.push_back(static_cast<int>(i));
+    }
+
+    std::function<void(const BuildNode &, uint64_t &, uint32_t &)> computeSums =
+        [&](const BuildNode &n, uint64_t &size, uint32_t &count) {
+            for (int idx : n.files) {
+                size += s.session.records[static_cast<size_t>(idx)].size;
+                ++count;
+            }
+            for (const auto &kv : n.children) computeSums(kv.second, size, count);
+        };
+
+    std::function<void(const BuildNode &, int, const std::string &, const std::string &)> emitFolder =
+        [&](const BuildNode &n, int depth, const std::string &key, const std::string &label) {
+            uint64_t size = 0;
+            uint32_t count = 0;
+            computeSums(n, size, count);
+            bool open = true;
+            auto it = s.folderOpen.find(key);
+            if (it != s.folderOpen.end()) open = it->second;
+            bool hasChildren = !n.children.empty() || !n.files.empty();
+            s.tree.push_back(TreeNode{-1, label, key, depth, true, open, hasChildren, size, count});
+            if (!open) return;
+
+            for (const auto &kv : n.children)
+                emitFolder(kv.second, depth + 1, key + "/" + kv.first, kv.first);
+
+            std::vector<int> files = n.files;
+            std::sort(files.begin(), files.end(), [&](int a, int b) {
+                const std::string &na = s.session.records[static_cast<size_t>(a)].name;
+                const std::string &nb = s.session.records[static_cast<size_t>(b)].name;
+                if (na != nb) return na < nb;
+                return a < b;
+            });
+            for (int idx : files) {
+                const dd::FileRecord &r = s.session.records[static_cast<size_t>(idx)];
+                s.tree.push_back(TreeNode{idx, r.name, "", depth + 1, false, false, false,
+                                          r.size, 1});
+            }
+        };
+
+    for (int cat = 1; cat <= 6; ++cat) {
+        if (roots[cat].children.empty() && roots[cat].files.empty()) continue;
+        char key[32];
+        std::snprintf(key, sizeof(key), "cat:%d", cat);
+        uint64_t size = 0;
+        uint32_t count = 0;
+        computeSums(roots[cat], size, count);
+        char label[64];
+        std::snprintf(label, sizeof(label), "%s (%u)",
+                      dd::categoryName(static_cast<dd::Category>(cat)), count);
+        emitFolder(roots[cat], 0, key, label);
     }
 }
 
@@ -301,6 +425,57 @@ void drawSidebar(cui_ctx *ui, AppState &s) {
         cui_pop_id(ui);
     }
 
+    if (s.resultsReady) {
+        cui_separator(ui);
+        cui_nav_section(ui, "SCAN RESULTS");
+
+        uint32_t counts[7] = {};
+        uint32_t total = 0;
+        for (const auto &r : s.session.records) {
+            ++counts[categoryOf(r)];
+            ++total;
+        }
+
+        static const dd::Category cats[6] = {
+            dd::Category::Pictures, dd::Category::Videos, dd::Category::Audio,
+            dd::Category::Documents, dd::Category::Archives, dd::Category::Other,
+        };
+        static const char *icons[6] = {
+            CUI_ICON_IMAGE, CUI_ICON_VIDEO, CUI_ICON_MUSIC,
+            CUI_ICON_FILE_TEXT, CUI_ICON_ARCHIVE, CUI_ICON_LAYERS,
+        };
+
+        cui_push_id_int(ui, 900);
+        cui_nav_opts all{};
+        all.icon = CUI_ICON_GRID_3X3;
+        all.group = "categories";
+        all.selected = s.category == 0;
+        char allBadge[16];
+        std::snprintf(allBadge, sizeof(allBadge), "%u", total);
+        all.badge = allBadge;
+        if (cui_nav_item_ex(ui, "All files", &all)) {
+            s.category = 0;
+            s.treeDirty = true;
+        }
+        cui_pop_id(ui);
+
+        for (int i = 0; i < 6; ++i) {
+            cui_push_id_int(ui, 910 + i);
+            cui_nav_opts nav{};
+            nav.icon = icons[i];
+            nav.group = "categories";
+            nav.selected = s.category == i + 1;
+            char badge[16];
+            std::snprintf(badge, sizeof(badge), "%u", counts[i + 1]);
+            nav.badge = badge;
+            if (cui_nav_item_ex(ui, dd::categoryName(cats[i]), &nav)) {
+                s.category = i + 1;
+                s.treeDirty = true;
+            }
+            cui_pop_id(ui);
+        }
+    }
+
     cui_spacer(ui);
     cui_separator(ui);
 
@@ -381,7 +556,7 @@ void drawDetailCard(cui_ctx *ui, AppState &s) {
 }
 
 void drawResults(cui_ctx *ui, AppState &s) {
-    if (s.visible.empty()) {
+    if (s.tree.empty()) {
         cui_empty_opts empty{};
         empty.icon = CUI_ICON_SEARCH;
         empty.description = s.resultsReady
@@ -402,22 +577,48 @@ void drawResults(cui_ctx *ui, AppState &s) {
     cui_scroll_begin(ui, &scroll);
 
     cui_table_column columns[] = {
-        {"Status", CUI_PX(140), CUI_TEXT_LEFT, false},
-        {"Chance", CUI_PX(88), CUI_TEXT_LEFT, false},
+        {"", CUI_PX(34), CUI_TEXT_LEFT, false},
+        {"Status", CUI_PX(110), CUI_TEXT_LEFT, false},
+        {"Chance", CUI_PX(84), CUI_TEXT_LEFT, false},
         {"Name", CUI_FILL, CUI_TEXT_LEFT, false},
         {"Path", CUI_FILL, CUI_TEXT_LEFT, false},
         {"Size", CUI_PX(92), CUI_TEXT_RIGHT, false},
-        {"Type", CUI_PX(90), CUI_TEXT_LEFT, false},
-        {"Source", CUI_PX(90), CUI_TEXT_LEFT, false},
+        {"Type", CUI_PX(108), CUI_TEXT_LEFT, false},
+        {"Source", CUI_PX(88), CUI_TEXT_LEFT, false},
     };
 
     cui_table_opts table{};
     table.striped = true;
     table.compact = true;
     table.selectable = true;
-    if (cui_table_begin_ex(ui, "results", columns, 7, &table)) {
-        for (int row = 0; row < static_cast<int>(s.visible.size()); ++row) {
-            const int index = s.visible[static_cast<size_t>(row)];
+    if (cui_table_begin_ex(ui, "results", columns, 8, &table)) {
+        for (size_t row = 0; row < s.tree.size(); ++row) {
+            const TreeNode &node = s.tree[row];
+            if (node.folder) {
+                cui_push_id_int(ui, -static_cast<int>(row) - 1);
+                cui_table_row(ui, false);
+                cui_table_cell_text(ui, "");
+                cui_table_cell_text(ui, "");
+                cui_table_cell_text(ui, "");
+                cui_table_cell(ui);
+                bool open = node.open;
+                const char *icon = node.depth == 0 ? CUI_ICON_LAYERS : CUI_ICON_FOLDER;
+                if (cui_tree_cell(ui, node.label.c_str(), node.depth, node.hasChildren,
+                                  &open, icon)) {
+                    s.folderOpen[node.key] = open;
+                    s.treeDirty = true;
+                }
+                cui_table_cell_text(ui, "");
+                cui_table_cell_text(ui, dd::formatBytes(node.sizeSum).c_str());
+                char kind[48];
+                std::snprintf(kind, sizeof(kind), "Folder (%u)", node.fileCount);
+                cui_table_cell_text(ui, kind);
+                cui_table_cell_text(ui, "");
+                cui_pop_id(ui);
+                continue;
+            }
+
+            const int index = node.recordIndex;
             const dd::FileRecord &r = s.session.records[static_cast<size_t>(index)];
             cui_push_id_int(ui, index);
             if (cui_table_row(ui, s.selectedRow == index)) s.selectedRow = index;
@@ -601,7 +802,7 @@ void drawFrame(cui_ctx *ui, AppState &s) {
         s.recoverActive = false;
         s.showRecoveryToast = s.recoverSuccess;
     }
-    rebuildVisible(s);
+    rebuildTree(s);
 
     cui_box root{};
     root.id = "root";

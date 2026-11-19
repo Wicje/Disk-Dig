@@ -15,10 +15,6 @@ namespace dd {
 namespace {
 
 constexpr uint32_t FAT_ENTRY_FREE = 0x00000000u;
-constexpr uint32_t FAT_ENTRY_BAD = 0x0FFFFFF7u;
-constexpr uint32_t FAT_ENTRY_EOC_MIN = 0x0FFFFFF8u;
-constexpr uint32_t FAT_ENTRY_MASK = 0x0FFFFFFFu;
-constexpr uint32_t FAT_MAX_VALID = 0x0FFFFFEFu;
 constexpr size_t DIR_ENTRY_SIZE = 32;
 constexpr uint8_t ATTR_READ_ONLY = 0x01;
 constexpr uint8_t ATTR_HIDDEN = 0x02;
@@ -39,8 +35,11 @@ struct FatInfo {
     uint32_t dataSectors = 0;
     uint32_t clusterCount = 0;
     uint32_t rootCluster = 0;
+    uint32_t rootDirSectors = 0;
+    uint64_t rootDirOffset = 0;
     uint64_t fatOffset = 0;
     uint64_t clusterBytes = 0;
+    uint8_t fatBits = 32;
 };
 
 struct ScanState {
@@ -53,10 +52,22 @@ struct ScanState {
 
 bool isPow2(uint32_t v) { return v && ((v & (v - 1)) == 0); }
 
+bool isFatEnd(const FatInfo &fi, uint32_t entry) {
+    switch (fi.fatBits) {
+        case 12: return entry == FAT_ENTRY_FREE || entry == 0xFFF7u || entry >= 0xFF8u;
+        case 16: return entry == FAT_ENTRY_FREE || entry == 0xFFF7u || entry >= 0xFFF8u;
+        default: return entry == FAT_ENTRY_FREE || entry == 0x0FFFFFF7u || entry >= 0x0FFFFFF8u;
+    }
+}
+
+uint32_t fatMaxValid(const FatInfo &fi) {
+    return fi.fatBits == 12 ? 0xFEfu : (fi.fatBits == 16 ? 0xFFEFu : 0x0FFFFFEFu);
+}
+
 uint64_t clusterOffset(const FatInfo &fi, uint64_t partitionStart, uint32_t cluster) {
-    return partitionStart + (static_cast<uint64_t>(fi.dataStart) +
+    return partitionStart + (static_cast<uint64_t>(fi.dataStart) + fi.rootDirSectors +
                              static_cast<uint64_t>(cluster - 2) * fi.sectorsPerCluster) *
-                                fi.bytesPerSector;
+                                 fi.bytesPerSector;
 }
 
 bool clusterInRange(const ScanContext &ctx, const FatInfo &fi, uint32_t cluster) {
@@ -68,11 +79,19 @@ bool clusterInRange(const ScanContext &ctx, const FatInfo &fi, uint32_t cluster)
 }
 
 uint32_t readFatEntry(const ScanContext &ctx, const FatInfo &fi, uint32_t cluster) {
-    uint64_t off = fi.fatOffset + static_cast<uint64_t>(cluster) * 4u;
     bool ok = false;
-    uint32_t v = ctx.reader.u32(off, &ok);
-    if (!ok) return FAT_ENTRY_BAD;
-    return v & FAT_ENTRY_MASK;
+    if (fi.fatBits == 16) {
+        uint16_t v = ctx.reader.u16(fi.fatOffset + static_cast<uint64_t>(cluster) * 2u, &ok);
+        return ok ? v : 0xFFF7u;
+    }
+    if (fi.fatBits == 12) {
+        uint64_t byteOff = fi.fatOffset + static_cast<uint64_t>(cluster) * 3u / 2u;
+        uint16_t pair = ctx.reader.u16(byteOff, &ok);
+        if (!ok) return 0xFF7u;
+        return (cluster & 1u) ? (pair >> 4) : (pair & 0x0FFFu);
+    }
+    uint32_t v = ctx.reader.u32(fi.fatOffset + static_cast<uint64_t>(cluster) * 4u, &ok);
+    return ok ? (v & 0x0FFFFFFFu) : 0x0FFFFFF7u;
 }
 
 void appendUtf8(std::string &out, uint16_t ch) {
@@ -234,8 +253,8 @@ std::vector<ByteRange> coalesceChain(const ScanContext &ctx, const FatInfo &fi, 
             else remaining -= len;
         }
         uint32_t entry = readFatEntry(ctx, fi, cluster);
-        if (entry >= FAT_ENTRY_EOC_MIN || entry == FAT_ENTRY_BAD || entry == FAT_ENTRY_FREE) break;
-        if (entry < 2 || entry > FAT_MAX_VALID) break;
+        if (isFatEnd(fi, entry)) break;
+        if (entry < 2 || entry > fatMaxValid(fi)) break;
         if (existing && remaining == 0) break;
         cluster = entry;
     }
@@ -279,7 +298,77 @@ void emitRecord(ScanContext &ctx, ScanState &st, const FileRecord &rec) {
 
 void processEntry(ScanContext &ctx, const FatInfo &fi, ScanState &st,
                   const uint8_t *e, const std::string &dirPath,
-                  const std::string &lfnName, std::vector<uint32_t> &subdirsToVisit);
+                  const std::string &lfnName,
+                  std::vector<std::pair<uint32_t, std::string>> &subdirsToVisit);
+
+void walkDirectory(ScanContext &ctx, const FatInfo &fi, ScanState &st, uint32_t startCluster,
+                   const std::string &dirPath, int depth);
+
+void processDirBuffer(ScanContext &ctx, const FatInfo &fi, ScanState &st,
+                      const std::vector<uint8_t> &buf, const std::string &dirPath,
+                      std::vector<std::pair<uint32_t, std::string>> &subdirsOut) {
+    std::vector<LfnPart> lfnParts;
+    bool lfnActive = false;
+
+    for (size_t off = 0; off + DIR_ENTRY_SIZE <= buf.size(); off += DIR_ENTRY_SIZE) {
+        if (ctx.cancelledNow()) return;
+        if (st.entriesSeen >= 200000 || st.recordsEmitted >= 200000) return;
+        const uint8_t *e = buf.data() + off;
+        uint8_t first = e[0];
+        if (first == 0x00) break;
+
+        uint8_t attr = e[11];
+        bool deletedEntry = (first == 0xE5);
+
+        if (attr == ATTR_LFN) {
+            if ((first & 0x40) || !lfnActive) {
+                lfnParts.clear();
+                lfnActive = true;
+            }
+            lfnParts.push_back(parseLfnPart(e, deletedEntry));
+            continue;
+        }
+
+        if (attr & ATTR_VOLUME_ID) {
+            lfnParts.clear();
+            lfnActive = false;
+            continue;
+        }
+
+        std::string lfnName = lfnParts.empty() ? std::string() : lfnToUtf8(lfnParts);
+        lfnParts.clear();
+        lfnActive = false;
+        st.entriesSeen++;
+
+        std::vector<std::pair<uint32_t, std::string>> subdirs;
+        processEntry(ctx, fi, st, e, dirPath, lfnName, subdirs);
+        for (const auto &sd : subdirs) {
+            std::string name = sd.second.empty() ? shortNameFromEntry(e, deletedEntry) : sd.second;
+            subdirsOut.push_back({sd.first, name});
+        }
+    }
+}
+
+void walkFixedRoot(ScanContext &ctx, const FatInfo &fi, ScanState &st,
+                   const std::string &dirPath, int depth) {
+    if (ctx.cancelledNow() || depth > 12) return;
+    if (!st.visitedDirChains.insert(0).second) return;
+    if (fi.rootDirSectors == 0) return;
+
+    uint64_t bytes = static_cast<uint64_t>(fi.rootDirSectors) * fi.bytesPerSector;
+    std::vector<uint8_t> buf(static_cast<size_t>(bytes));
+    if (!ctx.reader.readExact(fi.rootDirOffset, buf.data(), buf.size())) return;
+
+    std::vector<std::pair<uint32_t, std::string>> subdirs;
+    processDirBuffer(ctx, fi, st, buf, dirPath, subdirs);
+    for (const auto &sd : subdirs) {
+        std::string subPath = dirPath;
+        if (!subPath.empty() && subPath.back() != '/') subPath += '/';
+        subPath += sd.second;
+        walkDirectory(ctx, fi, st, sd.first, subPath, depth + 1);
+        if (ctx.cancelledNow() || st.entriesSeen >= 200000 || st.recordsEmitted >= 200000) return;
+    }
+}
 
 void walkDirectory(ScanContext &ctx, const FatInfo &fi, ScanState &st, uint32_t startCluster,
                    const std::string &dirPath, int depth) {
@@ -303,72 +392,28 @@ void walkDirectory(ScanContext &ctx, const FatInfo &fi, ScanState &st, uint32_t 
         std::vector<uint8_t> buf;
         if (!readCluster(ctx, fi, cluster, buf)) break;
 
-        std::vector<LfnPart> lfnParts;
-        bool lfnActive = false;
-        bool endOfDir = false;
-
-        for (size_t off = 0; off + DIR_ENTRY_SIZE <= buf.size(); off += DIR_ENTRY_SIZE) {
-            if (ctx.cancelledNow()) return;
-            if (st.entriesSeen >= 200000 || st.recordsEmitted >= 200000) return;
-            const uint8_t *e = buf.data() + off;
-            uint8_t first = e[0];
-            if (first == 0x00) { endOfDir = true; break; }
-
-            uint8_t attr = e[11];
-            bool deletedEntry = (first == 0xE5);
-
-            if (attr == ATTR_LFN) {
-                if ((first & 0x40) || !lfnActive) {
-                    lfnParts.clear();
-                    lfnActive = true;
-                }
-                lfnParts.push_back(parseLfnPart(e, deletedEntry));
-                continue;
-            }
-
-            if (attr & ATTR_VOLUME_ID) {
-                lfnParts.clear();
-                lfnActive = false;
-                continue;
-            }
-
-            // short entry (file/dir, existing or deleted)
-            std::string lfnName;
-            if (!lfnParts.empty()) {
-                lfnName = lfnToUtf8(lfnParts);
-            }
-            lfnParts.clear();
-            lfnActive = false;
-
-            st.entriesSeen++;
-
-            std::vector<uint32_t> subdirs;
-            processEntry(ctx, fi, st, e, dirPath, lfnName, subdirs);
-            for (uint32_t sd : subdirs) {
-                // recurse into existing subdirectory
-                std::string subName = shortNameFromEntry(e, deletedEntry);
-                if (!lfnName.empty()) subName = lfnName;
-                std::string subPath = dirPath;
-                if (!subPath.empty() && subPath.back() != '/') subPath += '/';
-                subPath += subName;
-                if (subPath.empty()) subPath = "/" + subName;
-                walkDirectory(ctx, fi, st, sd, subPath, depth + 1);
-                if (ctx.cancelledNow() || st.entriesSeen >= 200000 || st.recordsEmitted >= 200000) return;
-            }
+        std::vector<std::pair<uint32_t, std::string>> subdirs;
+        processDirBuffer(ctx, fi, st, buf, dirPath, subdirs);
+        if (ctx.cancelledNow() || st.entriesSeen >= 200000 || st.recordsEmitted >= 200000) return;
+        for (const auto &sd : subdirs) {
+            std::string subPath = dirPath;
+            if (!subPath.empty() && subPath.back() != '/') subPath += '/';
+            subPath += sd.second;
+            walkDirectory(ctx, fi, st, sd.first, subPath, depth + 1);
+            if (ctx.cancelledNow() || st.entriesSeen >= 200000 || st.recordsEmitted >= 200000) return;
         }
 
-        if (endOfDir) break;
-
         uint32_t entry = readFatEntry(ctx, fi, cluster);
-        if (entry >= FAT_ENTRY_EOC_MIN || entry == FAT_ENTRY_BAD || entry == FAT_ENTRY_FREE) break;
-        if (entry < 2 || entry > FAT_MAX_VALID) break;
+        if (isFatEnd(fi, entry)) break;
+        if (entry < 2 || entry > fatMaxValid(fi)) break;
         cluster = entry;
     }
 }
 
 void processEntry(ScanContext &ctx, const FatInfo &fi, ScanState &st,
                   const uint8_t *e, const std::string &dirPath,
-                  const std::string &lfnName, std::vector<uint32_t> &subdirsToVisit) {
+                  const std::string &lfnName,
+                  std::vector<std::pair<uint32_t, std::string>> &subdirsToVisit) {
     uint8_t first = e[0];
     bool deleted = (first == 0xE5);
     uint8_t attr = e[11];
@@ -413,7 +458,7 @@ void processEntry(ScanContext &ctx, const FatInfo &fi, ScanState &st,
         // existing
         if (!ctx.options.includeExisting) {
             // but we may still need to recurse into existing directories
-            if (isDir && firstCluster >= 2) subdirsToVisit.push_back(firstCluster);
+            if (isDir && firstCluster >= 2) subdirsToVisit.push_back({firstCluster, name});
             return;
         }
         rec.status = Status::Existing;
@@ -430,7 +475,7 @@ void processEntry(ScanContext &ctx, const FatInfo &fi, ScanState &st,
             }
         }
         emitRecord(ctx, st, rec);
-        if (isDir && firstCluster >= 2) subdirsToVisit.push_back(firstCluster);
+        if (isDir && firstCluster >= 2) subdirsToVisit.push_back({firstCluster, name});
         return;
     }
 
@@ -455,7 +500,8 @@ void processEntry(ScanContext &ctx, const FatInfo &fi, ScanState &st,
                     uint64_t off = clusterOffset(fi, ctx.partitionStart, firstCluster);
                     rec.ranges.push_back(ByteRange{off, std::min<uint64_t>(fi.clusterBytes, 65536u)});
                 }
-            } else if (fe == FAT_ENTRY_EOC_MIN || (fe >= 2 && fe <= FAT_MAX_VALID)) {
+            } else if (fe != FAT_ENTRY_FREE &&
+                       (isFatEnd(fi, fe) || (fe >= 2 && fe <= fatMaxValid(fi)))) {
                 rec.chance = Chance::Medium;
                 rec.why = "Partial FAT chain still present; directory data may be recoverable";
                 rec.ranges = coalesceChain(ctx, fi, firstCluster, fi.clusterBytes, false);
@@ -493,7 +539,8 @@ void processEntry(ScanContext &ctx, const FatInfo &fi, ScanState &st,
     }
 
     uint32_t firstFat = readFatEntry(ctx, fi, firstCluster);
-    bool partialChain = (firstFat == FAT_ENTRY_EOC_MIN || (firstFat >= 2 && firstFat <= FAT_MAX_VALID));
+    bool partialChain = firstFat != FAT_ENTRY_FREE &&
+                        (isFatEnd(fi, firstFat) || (firstFat >= 2 && firstFat <= fatMaxValid(fi)));
 
     if (partialChain) {
         rec.ranges = coalesceChain(ctx, fi, firstCluster, logicalSize, false);
@@ -555,62 +602,72 @@ void processEntry(ScanContext &ctx, const FatInfo &fi, ScanState &st,
 
 void scanFat32(ScanContext &ctx) {
     if (ctx.cancelledNow()) return;
-    ctx.progress(0, "Reading FAT32 boot sector");
+    ctx.progress(0, "Reading FAT boot sector");
 
     const uint64_t bpb = ctx.partitionStart;
     if (ctx.partitionLength < 512) return;
 
     bool ok = false;
-    uint8_t sig[8]{};
-    if (!ctx.reader.readExact(bpb + 82, sig, 8)) return;
-    if (std::memcmp(sig, "FAT32   ", 8) != 0) return;
-
     FatInfo fi;
     fi.bytesPerSector = ctx.reader.u16(bpb + 11, &ok); if (!ok) return;
     fi.sectorsPerCluster = ctx.reader.u8(bpb + 13, &ok); if (!ok) return;
     fi.reservedSectors = ctx.reader.u16(bpb + 14, &ok); if (!ok) return;
     fi.numFATs = ctx.reader.u8(bpb + 16, &ok); if (!ok) return;
-    uint16_t rootEntries = ctx.reader.u16(bpb + 17, &ok); if (!ok) return; (void)rootEntries;
+    uint16_t rootEntries = ctx.reader.u16(bpb + 17, &ok); if (!ok) return;
+    uint32_t totalSec16 = ctx.reader.u16(bpb + 19, &ok); if (!ok) return;
     uint16_t fatSize16 = ctx.reader.u16(bpb + 22, &ok); if (!ok) return;
-    uint16_t totalSec16 = ctx.reader.u16(bpb + 19, &ok); if (!ok) return;
     uint32_t totalSec32 = ctx.reader.u32(bpb + 32, &ok); if (!ok) return;
     uint32_t fatSize32 = ctx.reader.u32(bpb + 36, &ok); if (!ok) return;
     fi.rootCluster = ctx.reader.u32(bpb + 44, &ok); if (!ok) return;
-    uint32_t fsInfo = ctx.reader.u32(bpb + 48, &ok); if (!ok) return; (void)fsInfo;
 
     if (fi.bytesPerSector < 512 || fi.bytesPerSector > 4096 || !isPow2(fi.bytesPerSector)) return;
-    if (fi.sectorsPerCluster == 0 || fi.sectorsPerCluster > 128) return;
-    if (fi.numFATs == 0) return;
+    if (fi.sectorsPerCluster == 0 || fi.sectorsPerCluster > 128 || fi.numFATs == 0) return;
 
     fi.fatSectors = fatSize32 ? fatSize32 : fatSize16;
     fi.totalSectors = totalSec16 ? totalSec16 : totalSec32;
     if (fi.totalSectors == 0 || fi.fatSectors == 0) return;
 
+    fi.rootDirSectors = static_cast<uint32_t>(
+        (static_cast<uint64_t>(rootEntries) * 32 + fi.bytesPerSector - 1) / fi.bytesPerSector);
     uint64_t dataStart64 = static_cast<uint64_t>(fi.reservedSectors) +
                            static_cast<uint64_t>(fi.numFATs) * fi.fatSectors;
-    if (dataStart64 >= fi.totalSectors) return;
+    if (dataStart64 + fi.rootDirSectors >= fi.totalSectors) return;
     fi.dataStart = static_cast<uint32_t>(dataStart64);
-    fi.dataSectors = fi.totalSectors - fi.dataStart;
-    if (fi.sectorsPerCluster == 0) return;
+    fi.dataSectors = fi.totalSectors - dataStart64 - fi.rootDirSectors;
     fi.clusterCount = fi.dataSectors / fi.sectorsPerCluster;
     if (fi.clusterCount < 1) return;
 
-    fi.fatOffset = ctx.partitionStart + static_cast<uint64_t>(fi.reservedSectors) * fi.bytesPerSector;
+    fi.fatOffset = bpb + static_cast<uint64_t>(fi.reservedSectors) * fi.bytesPerSector;
+    fi.rootDirOffset = bpb + dataStart64 * fi.bytesPerSector;
     fi.clusterBytes = static_cast<uint64_t>(fi.sectorsPerCluster) * fi.bytesPerSector;
     if (fi.clusterBytes == 0) return;
 
-    // Basic bounds sanity check against partition length / reader
-    uint64_t fatRegionEnd = fi.fatOffset + static_cast<uint64_t>(fi.numFATs) * fi.fatSectors * fi.bytesPerSector;
+    uint64_t fatRegionEnd = fi.fatOffset +
+                            static_cast<uint64_t>(fi.numFATs) * fi.fatSectors * fi.bytesPerSector;
     if (fatRegionEnd < fi.fatOffset) return;
-    uint64_t dataRegionStart = clusterOffset(fi, ctx.partitionStart, 2);
-    if (dataRegionStart < ctx.partitionStart) return;
+    uint64_t dataRegionStart = clusterOffset(fi, bpb, 2);
+    if (dataRegionStart < bpb) return;
 
-    if (fi.rootCluster < 2) fi.rootCluster = 2;
+    char fstype[9]{};
+    bool hasFat32Sig = ctx.reader.readExact(bpb + 82, fstype, 8) &&
+                       std::memcmp(fstype, "FAT32   ", 8) == 0;
+    if (hasFat32Sig || (rootEntries == 0 && fi.clusterCount >= 65525)) {
+        fi.fatBits = 32;
+    } else if (fi.clusterCount >= 4085) {
+        fi.fatBits = 16;
+    } else {
+        fi.fatBits = 12;
+    }
 
     ScanState st;
-    ctx.progress(5, "Scanning FAT32 directory tree");
-    walkDirectory(ctx, fi, st, fi.rootCluster, "/", 0);
-    ctx.progress(100, "FAT32 scan complete");
+    ctx.progress(5, "Scanning FAT directory tree");
+    if (fi.fatBits == 32) {
+        if (fi.rootCluster < 2 || fi.rootCluster > fi.clusterCount + 1) return;
+        walkDirectory(ctx, fi, st, fi.rootCluster, "/", 0);
+    } else {
+        walkFixedRoot(ctx, fi, st, "/", 0);
+    }
+    ctx.progress(100, "FAT scan complete");
 }
 
 } // namespace dd

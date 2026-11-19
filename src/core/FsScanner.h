@@ -19,6 +19,7 @@ struct ScanContext {
 
 void scanExt4(ScanContext &ctx);
 void scanFat32(ScanContext &ctx);
+void scanExfat(ScanContext &ctx);
 void scanNtfs(ScanContext &ctx);
 
 // Signature-based carving of unallocated space, deduplicated against files

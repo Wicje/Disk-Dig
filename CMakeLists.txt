@@ -19,6 +19,7 @@ add_executable(diskdig
     src/core/Recovery.cpp
     src/core/ext4/Ext4Scanner.cpp
     src/core/fat/FatScanner.cpp
+    src/core/exfat/ExfatScanner.cpp
     src/core/ntfs/NtfsScanner.cpp
     src/core/carver/Carver.cpp
     src/gui/App.cpp
