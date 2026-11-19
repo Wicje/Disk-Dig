@@ -70,6 +70,46 @@ bool sameMount(const std::string &sourcePath, const std::string &targetDir) {
     return !src.empty() && src == dst;
 }
 
+void makeDirs(const std::string &path) {
+    std::string cur;
+    size_t i = 0;
+    while (i < path.size()) {
+        size_t j = path.find('/', i);
+        if (j == std::string::npos) j = path.size();
+        cur.append(path.substr(i, j - i));
+        if (!cur.empty()) ::mkdir(cur.c_str(), 0755);
+        cur.push_back('/');
+        i = j + 1;
+    }
+}
+
+// Recreates the original folder structure below the target directory, like
+// Disk Drill. Returns "" when the record has no known path (e.g. carved).
+std::string relativeDirFor(const std::string &path) {
+    if (path.empty()) return {};
+    std::string p = path;
+    if (p.front() == '/') p.erase(0, 1);
+    auto slash = p.find_last_of('/');
+    if (slash == std::string::npos) return {};
+    std::string dir = p.substr(0, slash);
+    std::string out, comp;
+    for (size_t i = 0; i <= dir.size(); ++i) {
+        if (i == dir.size() || dir[i] == '/') {
+            if (comp != "." && comp != "..") {
+                std::string s = safeName(comp);
+                if (!s.empty()) {
+                    if (!out.empty()) out += '/';
+                    out += s;
+                }
+            }
+            comp.clear();
+        } else {
+            comp.push_back(dir[i]);
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 bool recoverFiles(const RawReader &source,
@@ -123,10 +163,16 @@ bool recoverFiles(const RawReader &source,
 
     for (const FileRecord *f : files) {
         if (cancelled && *cancelled) break;
+        std::string relDir = relativeDirFor(f->path);
+        std::string dir = targetDir;
+        if (!relDir.empty()) {
+            dir = targetDir + "/" + relDir;
+            makeDirs(dir);
+        }
         int index = 0;
         std::string path;
         do {
-            path = uniquePath(targetDir, f->name + (f->ranges.empty() ? ".bin" : ""), index++);
+            path = uniquePath(dir, f->name + (f->ranges.empty() ? ".bin" : ""), index++);
         } while (access(path.c_str(), F_OK) == 0 && index < 10000);
 
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
