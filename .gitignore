@@ -1,0 +1,12 @@
+build/
+*.o
+*.a
+*.d
+*.a.*
+.DS_Store
+.cache/
+recovered/
+*.img
+*.raw
+*.iso
+*.dd
