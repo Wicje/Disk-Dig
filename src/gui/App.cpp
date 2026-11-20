@@ -17,6 +17,7 @@
 #include <new>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace dd {
@@ -35,6 +36,7 @@ struct TreeNode {
     bool hasChildren = false;
     uint64_t sizeSum = 0;
     uint32_t fileCount = 0;
+    std::vector<int> members;  // folder nodes: record indices below them
 };
 
 struct AppState {
@@ -283,6 +285,12 @@ void rebuildTree(AppState &s) {
             for (const auto &kv : n.children) computeSums(kv.second, size, count);
         };
 
+    std::function<void(const BuildNode &, std::vector<int> &)> collectMembers =
+        [&](const BuildNode &n, std::vector<int> &out) {
+            out.insert(out.end(), n.files.begin(), n.files.end());
+            for (const auto &kv : n.children) collectMembers(kv.second, out);
+        };
+
     std::function<void(const BuildNode &, int, const std::string &, const std::string &)> emitFolder =
         [&](const BuildNode &n, int depth, const std::string &key, const std::string &label) {
             uint64_t size = 0;
@@ -292,7 +300,17 @@ void rebuildTree(AppState &s) {
             auto it = s.folderOpen.find(key);
             if (it != s.folderOpen.end()) open = it->second;
             bool hasChildren = !n.children.empty() || !n.files.empty();
-            s.tree.push_back(TreeNode{-1, label, key, depth, true, open, hasChildren, size, count});
+            TreeNode tn;
+            tn.label = label;
+            tn.key = key;
+            tn.depth = depth;
+            tn.folder = true;
+            tn.open = open;
+            tn.hasChildren = hasChildren;
+            tn.sizeSum = size;
+            tn.fileCount = count;
+            collectMembers(n, tn.members);
+            s.tree.push_back(std::move(tn));
             if (!open) return;
 
             for (const auto &kv : n.children)
@@ -597,7 +615,21 @@ void drawResults(cui_ctx *ui, AppState &s) {
             if (node.folder) {
                 cui_push_id_int(ui, -static_cast<int>(row) - 1);
                 cui_table_row(ui, false);
-                cui_table_cell_text(ui, "");
+                cui_table_cell(ui);
+                bool picked = !node.members.empty();
+                for (int idx : node.members) {
+                    if (idx < 0 || idx >= static_cast<int>(s.selected.size()) ||
+                        !s.selected[static_cast<size_t>(idx)]) {
+                        picked = false;
+                        break;
+                    }
+                }
+                if (cui_checkbox_ex(ui, "##pickdir", &picked, nullptr)) {
+                    for (int idx : node.members) {
+                        if (idx >= 0 && idx < static_cast<int>(s.selected.size()))
+                            s.selected[static_cast<size_t>(idx)] = picked ? 1 : 0;
+                    }
+                }
                 cui_table_cell_text(ui, "");
                 cui_table_cell_text(ui, "");
                 cui_table_cell(ui);
