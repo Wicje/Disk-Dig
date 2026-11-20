@@ -7,6 +7,15 @@ set(CMAKE_C_STANDARD 99)
 
 set(CUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+
+# Prefer SDL2 on Linux desktops: it runs natively on Wayland (and X11).
+if(NOT WIN32 AND NOT APPLE)
+    find_package(SDL2 QUIET)
+    if(SDL2_FOUND)
+        set(CUI_PLATFORM "sdl2" CACHE STRING "Window backend: auto, win32, cocoa, x11, sdl2, glfw")
+    endif()
+endif()
+
 add_subdirectory(third_party/CUI)
 
 add_executable(diskdig
