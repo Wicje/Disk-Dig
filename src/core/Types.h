@@ -82,6 +82,7 @@ const char *fsName(FsKind f);
 const char *categoryName(Category c);
 Category categoryFromName(const std::string &name);
 Category categoryFromType(const std::string &type);
+std::string extensionOf(const std::string &name);
 std::string formatBytes(uint64_t n);
 std::string typeFromName(const std::string &name);
 

@@ -56,11 +56,29 @@ const char *categoryName(Category c) {
     return "Other";
 }
 
-Category categoryFromName(const std::string &name) {
+// Extension of a file name. Carver names files "carved_<hex>_<ext>" without a
+// dot, so fall back to the last underscore for those.
+std::string extensionOf(const std::string &name) {
     auto dot = name.rfind('.');
-    if (dot == std::string::npos || dot + 1 >= name.size()) return Category::Other;
-    std::string ext = name.substr(dot + 1);
-    for (char &c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (dot != std::string::npos && dot + 1 < name.size()) {
+        std::string ext = name.substr(dot + 1);
+        for (char &c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        return ext;
+    }
+    if (name.rfind("carved_", 0) == 0) {
+        auto us = name.rfind('_');
+        if (us != std::string::npos && us + 1 < name.size()) {
+            std::string ext = name.substr(us + 1);
+            for (char &c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            return ext;
+        }
+    }
+    return {};
+}
+
+Category categoryFromName(const std::string &name) {
+    std::string ext = extensionOf(name);
+    if (ext.empty()) return Category::Other;
     struct Entry { const char *ext; Category cat; };
     static const Entry table[] = {
         {"jpg",Category::Pictures},{"jpeg",Category::Pictures},{"png",Category::Pictures},
@@ -117,10 +135,8 @@ Category categoryFromType(const std::string &type) {
 }
 
 std::string typeFromName(const std::string &name) {
-    auto dot = name.rfind('.');
-    if (dot == std::string::npos || dot + 1 >= name.size()) return "File";
-    std::string ext = name.substr(dot + 1);
-    for (char &c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    std::string ext = extensionOf(name);
+    if (ext.empty()) return "File";
     struct Entry { const char *ext; const char *label; };
     static const Entry table[] = {
         {"jpg","JPEG image"},{"jpeg","JPEG image"},{"png","PNG image"},{"gif","GIF image"},

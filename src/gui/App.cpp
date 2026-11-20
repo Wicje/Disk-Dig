@@ -266,13 +266,8 @@ void rebuildTree(AppState &s) {
         BuildNode *node = &roots[cat];
         if (r.status == dd::Status::Carved) {
             // carved files have no original folder: group them by extension
-            std::string ext;
-            auto dot = r.name.rfind('.');
-            if (dot == std::string::npos || dot + 1 >= r.name.size()) ext = "other";
-            else {
-                ext = r.name.substr(dot + 1);
-                for (char &c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            }
+            std::string ext = dd::extensionOf(r.name);
+            if (ext.empty()) ext = "other";
             roots[cat].extensions[ext].files.push_back(static_cast<int>(i));
             continue;
         }
