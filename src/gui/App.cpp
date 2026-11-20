@@ -37,6 +37,7 @@ struct TreeNode {
     uint64_t sizeSum = 0;
     uint32_t fileCount = 0;
     std::vector<int> members;  // folder nodes: record indices below them
+    const char *icon = CUI_ICON_FOLDER;
 };
 
 struct AppState {
@@ -247,6 +248,7 @@ void rebuildTree(AppState &s) {
 
     struct BuildNode {
         std::map<std::string, BuildNode> children;
+        std::map<std::string, BuildNode> extensions;  // carved files grouped by extension
         std::vector<int> files;
     };
 
@@ -262,6 +264,18 @@ void rebuildTree(AppState &s) {
         if (s.category != 0 && cat != s.category) continue;
 
         BuildNode *node = &roots[cat];
+        if (r.status == dd::Status::Carved) {
+            // carved files have no original folder: group them by extension
+            std::string ext;
+            auto dot = r.name.rfind('.');
+            if (dot == std::string::npos || dot + 1 >= r.name.size()) ext = "other";
+            else {
+                ext = r.name.substr(dot + 1);
+                for (char &c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            roots[cat].extensions[ext].files.push_back(static_cast<int>(i));
+            continue;
+        }
         std::string comp;
         for (size_t p = 0; p < r.path.size(); ++p) {
             if (r.path[p] == '/') {
@@ -283,23 +297,27 @@ void rebuildTree(AppState &s) {
                 ++count;
             }
             for (const auto &kv : n.children) computeSums(kv.second, size, count);
+            for (const auto &kv : n.extensions) computeSums(kv.second, size, count);
         };
 
     std::function<void(const BuildNode &, std::vector<int> &)> collectMembers =
         [&](const BuildNode &n, std::vector<int> &out) {
             out.insert(out.end(), n.files.begin(), n.files.end());
             for (const auto &kv : n.children) collectMembers(kv.second, out);
+            for (const auto &kv : n.extensions) collectMembers(kv.second, out);
         };
 
-    std::function<void(const BuildNode &, int, const std::string &, const std::string &)> emitFolder =
-        [&](const BuildNode &n, int depth, const std::string &key, const std::string &label) {
+    std::function<void(const BuildNode &, int, const std::string &, const std::string &,
+                       const char *)> emitFolder =
+        [&](const BuildNode &n, int depth, const std::string &key, const std::string &label,
+            const char *icon) {
             uint64_t size = 0;
             uint32_t count = 0;
             computeSums(n, size, count);
             bool open = true;
             auto it = s.folderOpen.find(key);
             if (it != s.folderOpen.end()) open = it->second;
-            bool hasChildren = !n.children.empty() || !n.files.empty();
+            bool hasChildren = !n.children.empty() || !n.extensions.empty() || !n.files.empty();
             TreeNode tn;
             tn.label = label;
             tn.key = key;
@@ -309,12 +327,23 @@ void rebuildTree(AppState &s) {
             tn.hasChildren = hasChildren;
             tn.sizeSum = size;
             tn.fileCount = count;
+            tn.icon = icon;
             collectMembers(n, tn.members);
             s.tree.push_back(std::move(tn));
             if (!open) return;
 
             for (const auto &kv : n.children)
-                emitFolder(kv.second, depth + 1, key + "/" + kv.first, kv.first);
+                emitFolder(kv.second, depth + 1, key + "/" + kv.first, kv.first,
+                           CUI_ICON_FOLDER);
+
+            for (const auto &kv : n.extensions) {
+                uint64_t sz = 0;
+                uint32_t cnt = 0;
+                computeSums(kv.second, sz, cnt);
+                char el[64];
+                std::snprintf(el, sizeof(el), "%s (%u)", kv.first.c_str(), cnt);
+                emitFolder(kv.second, depth + 1, key + "#" + kv.first, el, CUI_ICON_FILE);
+            }
 
             std::vector<int> files = n.files;
             std::sort(files.begin(), files.end(), [&](int a, int b) {
@@ -326,12 +355,14 @@ void rebuildTree(AppState &s) {
             for (int idx : files) {
                 const dd::FileRecord &r = s.session.records[static_cast<size_t>(idx)];
                 s.tree.push_back(TreeNode{idx, r.name, "", depth + 1, false, false, false,
-                                          r.size, 1});
+                                          r.size, 1, {}, CUI_ICON_FILE});
             }
         };
 
     for (int cat = 1; cat <= 6; ++cat) {
-        if (roots[cat].children.empty() && roots[cat].files.empty()) continue;
+        if (roots[cat].children.empty() && roots[cat].files.empty() &&
+            roots[cat].extensions.empty())
+            continue;
         char key[32];
         std::snprintf(key, sizeof(key), "cat:%d", cat);
         uint64_t size = 0;
@@ -340,7 +371,7 @@ void rebuildTree(AppState &s) {
         char label[64];
         std::snprintf(label, sizeof(label), "%s (%u)",
                       dd::categoryName(static_cast<dd::Category>(cat)), count);
-        emitFolder(roots[cat], 0, key, label);
+        emitFolder(roots[cat], 0, key, label, CUI_ICON_LAYERS);
     }
 }
 
@@ -634,9 +665,8 @@ void drawResults(cui_ctx *ui, AppState &s) {
                 cui_table_cell_text(ui, "");
                 cui_table_cell(ui);
                 bool open = node.open;
-                const char *icon = node.depth == 0 ? CUI_ICON_LAYERS : CUI_ICON_FOLDER;
                 if (cui_tree_cell(ui, node.label.c_str(), node.depth, node.hasChildren,
-                                  &open, icon)) {
+                                  &open, node.icon)) {
                     s.folderOpen[node.key] = open;
                     s.treeDirty = true;
                 }
