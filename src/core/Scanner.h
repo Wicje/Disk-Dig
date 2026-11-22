@@ -22,4 +22,12 @@ struct ScanSession {
 void runScan(ScanSession &session, const std::string &path,
              const ScanOptions &options, ProgressFn progress, ResultFn result);
 
+// Persist a completed scan to a user cache so re-scanning the same source is
+// avoided. The cache is invalidated when the source size changes.
+bool loadScanCache(const std::string &source, uint64_t sourceSize,
+                   std::vector<FileRecord> &outRecords, ScanStats &outStats);
+bool saveScanCache(const std::string &source, uint64_t sourceSize,
+                   const std::vector<FileRecord> &records,
+                   const ScanStats &stats);
+
 } // namespace dd

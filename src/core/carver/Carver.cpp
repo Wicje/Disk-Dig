@@ -12,7 +12,7 @@
 namespace dd {
 namespace {
 
-constexpr size_t CHUNK_SIZE = 4u * 1024u * 1024u;
+constexpr size_t CHUNK_SIZE = 16u * 1024u * 1024u;
 constexpr size_t OVERLAP = 64u * 1024u;
 constexpr size_t BLOCK_SIZE = 256u * 1024u;
 constexpr size_t MAX_HEADER = 16u;
@@ -20,6 +20,7 @@ constexpr uint64_t JPEG_LIMIT = 32u * 1024u * 1024u;
 constexpr uint64_t ZIP_LIMIT = 64u * 1024u * 1024u;
 constexpr uint64_t DEFAULT_LIMIT = 16u * 1024u * 1024u;
 constexpr uint64_t NEXT_HEADER_LIMIT = 64u * 1024u * 1024u;
+constexpr uint64_t VIDEO_LIMIT = std::numeric_limits<uint64_t>::max();
 constexpr uint64_t FIRST_ID = 90000000ULL;
 
 struct Range {
@@ -32,6 +33,9 @@ const uint8_t PNG_EOF[] = {'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82};
 const uint8_t GIF_EOF[] = {0x3B};
 const uint8_t PDF_EOF[] = {'%', '%', 'E', 'O', 'F'};
 const uint8_t ZIP_EOF[] = {'P', 'K', 0x05, 0x06};
+const uint8_t MPEG_PS_EOF[] = {0x00, 0x00, 0x01, 0xB9};
+const uint8_t ASF_GUID[] = {0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
+                            0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C};
 
 struct Match {
     const char *ext = "bin";
@@ -40,6 +44,7 @@ struct Match {
     size_t footerLen = 0;
     uint64_t limit = DEFAULT_LIMIT;
     uint64_t declared = 0;
+    bool boxChain = false;  // ISO-BMFF (MP4/MOV/3GP): length comes from the box chain
 };
 
 bool eq(const uint8_t *p, size_t n, const char *s, size_t len) {
@@ -51,16 +56,39 @@ uint32_t le32(const uint8_t *p) {
            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
 
+uint64_t le64(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) v = (v << 8) | p[i];
+    return v;
+}
+
 bool matchAt(const uint8_t *p, size_t n, Match &m) {
     m = Match{};
     if (n < 2) return false;
 
     if (n >= 8 && p[4] == 'f' && p[5] == 't' && p[6] == 'y' && p[7] == 'p') {
-        m.ext = (n >= 12 && eq(p + 8, n - 8, "qt  ", 4)) ? "mov"
-                : (n >= 11 && p[8] == '3' && p[9] == 'g' && p[10] == 'p') ? "3gp"
-                                                                          : "mp4";
+        const uint8_t *brand = p + 8;
+        const size_t brandLen = (n >= 12) ? 4 : 0;
+        m.ext = "mp4";
+        if (brandLen == 4) {
+            if (eq(brand, brandLen, "qt  ", 4)) m.ext = "mov";
+            else if (brand[0] == '3' && brand[1] == 'g' &&
+                     (brand[2] == 'p' || brand[2] == '2')) m.ext = "3gp";
+            else if (eq(brand, brandLen, "heic", 4) || eq(brand, brandLen, "heix", 4) ||
+                     eq(brand, brandLen, "hevc", 4) || eq(brand, brandLen, "hevx", 4) ||
+                     eq(brand, brandLen, "heim", 4) || eq(brand, brandLen, "heis", 4) ||
+                     eq(brand, brandLen, "hevm", 4) || eq(brand, brandLen, "hevs", 4))
+                m.ext = "heic";
+            else if (eq(brand, brandLen, "mif1", 4) || eq(brand, brandLen, "msf1", 4))
+                m.ext = "heif";
+            else if (eq(brand, brandLen, "avif", 4) || eq(brand, brandLen, "avis", 4))
+                m.ext = "avif";
+            else if (eq(brand, brandLen, "crx ", 4))
+                m.ext = "cr3";
+        }
         m.headerLen = 8;
-        m.declared = le32(p);
+        m.boxChain = true;
+        m.limit = VIDEO_LIMIT;
         return true;
     }
 
@@ -219,6 +247,46 @@ bool matchAt(const uint8_t *p, size_t n, Match &m) {
                 return true;
             }
             break;
+        case 0x1A:
+            if (n >= 4 && p[1] == 0x45 && p[2] == 0xDF && p[3] == 0xA3) {
+                m.ext = "mkv";
+                for (size_t k = 4; k + 4 <= n && k < 512; ++k) {
+                    if (eq(p + k, n - k, "webm", 4)) {
+                        m.ext = "webm";
+                        break;
+                    }
+                }
+                m.headerLen = 4;
+                m.limit = VIDEO_LIMIT;
+                return true;
+            }
+            break;
+        case 'F':
+            if (n >= 4 && eq(p, n, "FLV\x01", 4)) {
+                m.ext = "flv";
+                m.headerLen = 4;
+                m.limit = VIDEO_LIMIT;
+                return true;
+            }
+            break;
+        case 0x30:
+            if (n >= sizeof(ASF_GUID) && std::memcmp(p, ASF_GUID, sizeof(ASF_GUID)) == 0) {
+                m.ext = "wmv";
+                m.headerLen = sizeof(ASF_GUID);
+                m.limit = VIDEO_LIMIT;
+                return true;
+            }
+            break;
+        case 0x00:
+            if (n >= 4 && p[1] == 0x00 && p[2] == 0x01 && p[3] == 0xBA) {
+                m.ext = "mpg";
+                m.headerLen = 4;
+                m.footer = MPEG_PS_EOF;
+                m.footerLen = sizeof(MPEG_PS_EOF);
+                m.limit = VIDEO_LIMIT;
+                return true;
+            }
+            break;
         default:
             break;
     }
@@ -245,6 +313,16 @@ uint64_t nextCoveredStart(const std::vector<Range> &v, uint64_t pos) {
 }
 
 void addCovered(std::vector<Range> &v, const Range &r) {
+    // Carving walks positions monotonically, so the common case is appending a
+    // non-overlapping range at the end. Keep it O(1); fall back to a sorted
+    // insert only if a range ever arrives out of order.
+    if (!v.empty() && r.begin >= v.back().begin) {
+        if (r.begin <= v.back().end && r.end > v.back().end)
+            v.back().end = r.end;
+        else if (r.begin > v.back().end)
+            v.push_back(r);
+        return;
+    }
     auto it = std::lower_bound(v.begin(), v.end(), r.begin, rangeBefore);
     v.insert(it, r);
 }
@@ -259,6 +337,17 @@ std::string hexBytes(const uint8_t *p, size_t n) {
         s.push_back(digits[p[i] & 0x0F]);
     }
     return s;
+}
+
+static inline bool sigCandidate(uint8_t c) {
+    switch (c) {
+        case 0x00: case 0xFF: case 0x89: case 0x25: case 0x50: case 0x42: case 0x49:
+        case 0x4D: case 0x47: case 0x66: case 0x4F: case 0x52: case 0x37: case 0x1F:
+        case 0x7F: case 0x53: case 0x1A: case 0x46: case 0x30:
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool findFooter(const ScanContext &ctx, uint64_t start, uint64_t limitEnd,
@@ -312,6 +401,48 @@ bool findNextHeader(const ScanContext &ctx, uint64_t start, uint64_t limitEnd,
     return false;
 }
 
+// Walks the top-level ISO-BMFF box chain (ftyp/moov/mdat/...) and returns the
+// end offset of the last structurally valid box. The first box size is only the
+// size of that box (usually the small ftyp header), not the size of the file.
+uint64_t boxChainEnd(const ScanContext &ctx, uint64_t start, uint64_t limitEnd,
+                     std::string &boundary) {
+    uint64_t pos = start;
+    uint32_t boxes = 0;
+    bool sawMdat = false;
+    while (pos + 8 <= limitEnd && boxes < 100000) {
+        if (ctx.cancelledNow()) return 0;
+        uint8_t hdr[16];
+        if (ctx.reader.readAt(pos, hdr, 8) != 8) break;
+        uint64_t boxLen = le32(hdr);
+        size_t headerLen = 8;
+        if (boxLen == 1) {
+            if (pos + 16 > limitEnd) break;
+            if (ctx.reader.readAt(pos + 8, hdr + 8, 8) != 8) break;
+            boxLen = le64(hdr + 8);
+            headerLen = 16;
+        }
+        // A zero size means "extends to end of file"; the real end is unknown.
+        if (boxLen == 0 || boxLen < headerLen || boxLen > limitEnd - pos) break;
+        bool printable = true;
+        for (size_t k = 4; k < 8; ++k) {
+            uint8_t c = hdr[k];
+            if (c < 0x20 || c > 0x7E) {
+                printable = false;
+                break;
+            }
+        }
+        if (!printable) break;
+        if (std::memcmp(hdr + 4, "mdat", 4) == 0) sawMdat = true;
+        pos += boxLen;
+        ++boxes;
+    }
+    // Without a media-data box this is not a usable video; let the caller fall
+    // back to footer / next-signature detection.
+    if (!sawMdat) return 0;
+    boundary = "ISO-BMFF box chain";
+    return pos;
+}
+
 } // namespace
 
 void carve(ScanContext &ctx, const std::vector<FileRecord> &known) {
@@ -322,6 +453,11 @@ void carve(ScanContext &ctx, const std::vector<FileRecord> &known) {
     std::vector<Range> covered;
     covered.reserve(known.size() + 16);
     for (const FileRecord &rec : known) {
+        if (rec.status == Status::Deleted) {
+            uint64_t sum = 0;
+            for (const ByteRange &b : rec.ranges) sum += b.length;
+            if (sum < rec.size) continue;  // partial/stale deleted entry; let carving recover real data
+        }
         for (const ByteRange &b : rec.ranges) {
             if (b.length == 0 || b.offset >= total) continue;
             covered.push_back({b.offset, b.offset + std::min<uint64_t>(b.length, total - b.offset)});
@@ -366,8 +502,20 @@ void carve(ScanContext &ctx, const std::vector<FileRecord> &known) {
         size_t i = 0;
         while (i < primaryLen) {
             if (ctx.cancelledNow()) break;
+            const uint8_t *cursor = scanBuf.data() + i;
+            bool tryMatch = sigCandidate(cursor[0]);
+            // ftyp is detected by its "ftyp" magic at offset 4, whose leading
+            // box-size byte can be anything, so check it explicitly too.
+            if (!tryMatch && i + 4 < avail) {
+                tryMatch = (cursor[4] == 'f' && cursor[5] == 't' &&
+                            cursor[6] == 'y' && cursor[7] == 'p');
+            }
+            if (!tryMatch) {
+                ++i;
+                continue;
+            }
             Match m;
-            if (!matchAt(scanBuf.data() + i, avail - i, m)) {
+            if (!matchAt(cursor, avail - i, m)) {
                 ++i;
                 continue;
             }
@@ -390,7 +538,11 @@ void carve(ScanContext &ctx, const std::vector<FileRecord> &known) {
 
             uint64_t end = 0;
             std::string boundary;
-            if (m.declared > 0 && m.declared >= m.headerLen && m.declared <= limitEnd - hit) {
+            if (m.boxChain) {
+                end = boxChainEnd(ctx, hit, limitEnd, boundary);
+            }
+            if (end == 0 && m.declared > 0 && m.declared >= m.headerLen &&
+                m.declared <= limitEnd - hit) {
                 end = hit + m.declared;
                 boundary = "header size field";
             }

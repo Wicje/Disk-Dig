@@ -144,8 +144,23 @@ void startScan(AppState &s) {
             s.scanPhase = phase;
         };
         dd::ResultFn result = [](const dd::FileRecord &) {};
+
+        dd::RawReader probe;
+        std::string probeErr;
+        uint64_t srcSize = 0;
+        if (probe.open(path, &probeErr)) srcSize = probe.size();
+        bool loaded = dd::loadScanCache(path, srcSize, s.session.records, s.session.stats);
+        if (loaded && s.session.reader.open(path, &probeErr)) {
+            s.session.stats.total = srcSize;
+            setPhase(s, "Scan complete (cached)");
+            s.scanning.store(false);
+            return;
+        }
         dd::runScan(s.session, path, options, progress, result);
         setPhase(s, s.session.error.empty() ? "Scan complete" : "Scan stopped");
+        if (s.session.error.empty()) {
+            dd::saveScanCache(path, s.session.stats.total, s.session.records, s.session.stats);
+        }
         s.scanning.store(false);
     });
 }
