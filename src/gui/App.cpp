@@ -693,7 +693,13 @@ void drawResults(cui_ctx *ui, AppState &s) {
             const int index = node.recordIndex;
             const dd::FileRecord &r = s.session.records[static_cast<size_t>(index)];
             cui_push_id_int(ui, index);
-            if (cui_table_row(ui, s.selectedRow == index)) s.selectedRow = index;
+            if (cui_table_row(ui, s.selectedRow == index)) {
+                s.selectedRow = index;
+                // Clicking a row toggles its selection so the Recover button
+                // becomes enabled immediately without hunting for the checkbox.
+                if (static_cast<size_t>(index) < s.selected.size())
+                    s.selected[static_cast<size_t>(index)] ^= 1;
+            }
 
             cui_table_cell(ui);
             bool picked = s.selected[static_cast<size_t>(index)] != 0;
