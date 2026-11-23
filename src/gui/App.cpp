@@ -907,6 +907,7 @@ void drawFrame(cui_ctx *ui, AppState &s) {
     cui_secondary(ui, sourceLine);
 
     drawToolbar(ui, s);
+    drawRecoveryBar(ui, s);
     drawScanProgress(ui, s);
 
     if (s.resultsReady && !s.session.error.empty()) {
@@ -919,7 +920,6 @@ void drawFrame(cui_ctx *ui, AppState &s) {
 
     drawResults(ui, s);
     drawDetailCard(ui, s);
-    drawRecoveryBar(ui, s);
 
     cui_box_end(ui);
     cui_box_end(ui);
